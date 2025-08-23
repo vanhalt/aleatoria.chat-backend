@@ -436,6 +436,13 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	log.Printf("Client %s (ID: %s) connected to room: %s", conn.RemoteAddr(), userId, roomName)
 }
 
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	// A simple response to indicate the server is up and running
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Optional: for more detailed logging
 
@@ -445,6 +452,8 @@ func main() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, w, r)
 	})
+
+	http.HandleFunc("/health", healthCheckHandler)
 
 	log.Println("HTTP server started on :8085")
 	err := http.ListenAndServe(":8085", nil)
