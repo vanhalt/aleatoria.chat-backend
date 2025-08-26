@@ -88,6 +88,10 @@ type RequestRandomPeerPayload struct {
 	CurrentPeerID string `json:"currentPeerId,omitempty"` // If user is skipping someone
 }
 
+type UserListPayload struct {
+	Users []string `json:"users"`
+}
+
 
 func newHub() *Hub {
 	return &Hub{
@@ -156,6 +160,30 @@ func (h *Hub) sendToClientUnsafe(clientID string, message Message) {
 	}
 }
 
+func (h *Hub) broadcastUserList() {
+	log.Println("Broadcasting user list")
+	users := make([]string, 0, len(h.clientsByID))
+	for id := range h.clientsByID {
+		users = append(users, id)
+	}
+	userListPayload := UserListPayload{Users: users}
+	userListMessage := Message{
+		Type:    "update_user_list",
+		Payload: userListPayload,
+	}
+	jsonMessage, err := json.Marshal(userListMessage)
+	if err != nil {
+		log.Printf("Error marshalling user list message: %v", err)
+		return
+	}
+	for client := range h.clients {
+		select {
+		case client.send <- jsonMessage:
+		default:
+			log.Printf("Could not send user list to client %s, channel full.", client.id)
+		}
+	}
+}
 
 func (h *Hub) run() {
 	for {
@@ -179,6 +207,7 @@ func (h *Hub) run() {
 			}
 			log.Printf("Client %s (ID: %s) registered. Room: %s. Total clients: %d. Total clientsByID: %d",
 				client.conn.RemoteAddr(), client.id, client.room, len(h.clients), len(h.clientsByID))
+			h.broadcastUserList()
 			h.mu.Unlock()
 
 		case client := <-h.unregister:
@@ -199,6 +228,7 @@ func (h *Hub) run() {
 					}
 				}
 				log.Printf("Client %s (ID: %s) unregistered. Room: %s", client.conn.RemoteAddr(), client.id, client.room)
+				h.broadcastUserList()
 			}
 			h.mu.Unlock()
 
@@ -233,18 +263,30 @@ func (h *Hub) run() {
 						}
 					}
 				}
-			case "webrtc_offer", "webrtc_answer", "webrtc_candidate":
+			case "webrtc_offer", "webrtc_answer", "webrtc_candidate", "private_message":
 				if message.ToUser != "" {
-					log.Printf("Routing WebRTC message type %s from %s to %s", message.Type, message.FromUser, message.ToUser)
+					log.Printf("Routing direct message type %s from %s to %s", message.Type, message.FromUser, message.ToUser)
 					h.sendToClientUnsafe(message.ToUser, message)
 				} else {
-					log.Printf("WebRTC message type %s from %s without ToUser field. Discarding.", message.Type, message.FromUser)
+					log.Printf("Direct message type %s from %s without ToUser field. Discarding.", message.Type, message.FromUser)
 				}
 			case "assign_role": // Server originates this, but if client could send it, handle defensively
 				if message.ToUser != "" {
 					log.Printf("Routing assign_role message from %s to %s", message.FromUser, message.ToUser)
 					h.sendToClientUnsafe(message.ToUser, message)
 				}
+			case "get_user_list":
+				// Send the user list to the requesting client
+				users := make([]string, 0, len(h.clientsByID))
+				for id := range h.clientsByID {
+					users = append(users, id)
+				}
+				userListPayload := UserListPayload{Users: users}
+				userListMessage := Message{
+					Type:    "update_user_list",
+					Payload: userListPayload,
+				}
+				h.sendToClientUnsafe(message.FromUser, userListMessage)
 			case "user_available_webrtc":
 				log.Printf("User %s marked as available for WebRTC.", message.FromUser)
 				addUserToAvailable(message.FromUser)

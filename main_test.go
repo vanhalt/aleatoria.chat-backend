@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -83,6 +84,21 @@ func TestServeWsConnection(t *testing.T) {
 	hub.mu.Unlock()
 }
 
+// Helper function to read the next message, skipping user list updates
+func readNextMessage(t *testing.T, ws *websocket.Conn, timeout time.Duration) Message {
+	ws.SetReadDeadline(time.Now().Add(timeout))
+	defer ws.SetReadDeadline(time.Time{}) // Reset deadline
+	var msg Message
+	for {
+		if err := ws.ReadJSON(&msg); err != nil {
+			return Message{} // Return empty on timeout or error
+		}
+		if msg.Type != "update_user_list" {
+			return msg
+		}
+	}
+}
+
 // TestWebSocketChatMessage tests the sending and receiving of chat messages.
 func TestWebSocketChatMessage(t *testing.T) {
 	hub := newHub()
@@ -98,8 +114,10 @@ func TestWebSocketChatMessage(t *testing.T) {
 	defer server2.Close()
 	defer ws2.Close()
 
-	// Give some time for clients to register
-	time.Sleep(100 * time.Millisecond)
+	// Clear initial user list updates
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user1 connects
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user2 connects
+	readUserListUpdate(t, ws2, 200*time.Millisecond) // user2 connects
 
 	// User 1 sends a message
 	chatMsg := Message{
@@ -114,11 +132,7 @@ func TestWebSocketChatMessage(t *testing.T) {
 	}
 
 	// User 2 should receive the message
-	var receivedMsg Message
-	err := ws2.ReadJSON(&receivedMsg)
-	if err != nil {
-		t.Fatalf("Failed to read message: %v", err)
-	}
+	receivedMsg := readNextMessage(t, ws2, 200*time.Millisecond)
 
 	if receivedMsg.Type != "chat_message" {
 		t.Errorf("Expected message type 'chat_message', got '%s'", receivedMsg.Type)
@@ -151,7 +165,10 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 	defer server2.Close()
 	defer ws2.Close()
 
-	time.Sleep(100 * time.Millisecond) // Allow registration
+	// Clear initial user list updates
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user1 connects
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user2 connects
+	readUserListUpdate(t, ws2, 200*time.Millisecond) // user2 connects
 
 	// Step 1: Both users mark themselves as available for WebRTC
 	availableMsg := Message{Type: "user_available_webrtc"}
@@ -164,12 +181,7 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 	ws1.WriteJSON(requestMsg)
 
 	// Step 3: Verify both clients receive 'assign_role' messages
-	var msg1, msg2 Message
-
-	// User 1 receives role assignment
-	if err := ws1.ReadJSON(&msg1); err != nil {
-		t.Fatalf("User1 failed to read assign_role message: %v", err)
-	}
+	msg1 := readNextMessage(t, ws1, 200*time.Millisecond)
 	if msg1.Type != "assign_role" {
 		t.Errorf("User1 expected 'assign_role', got '%s'", msg1.Type)
 	}
@@ -178,10 +190,7 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 		t.Errorf("User1 expected peerId 'user2', got '%s'", payload1["peerId"])
 	}
 
-	// User 2 receives role assignment
-	if err := ws2.ReadJSON(&msg2); err != nil {
-		t.Fatalf("User2 failed to read assign_role message: %v", err)
-	}
+	msg2 := readNextMessage(t, ws2, 200*time.Millisecond)
 	if msg2.Type != "assign_role" {
 		t.Errorf("User2 expected 'assign_role', got '%s'", msg2.Type)
 	}
@@ -197,10 +206,7 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 	ws1.WriteJSON(offerMsg)
 
 	// User2 should receive the offer
-	var receivedOffer Message
-	if err := ws2.ReadJSON(&receivedOffer); err != nil {
-		t.Fatalf("User2 failed to read offer: %v", err)
-	}
+	receivedOffer := readNextMessage(t, ws2, 200*time.Millisecond)
 	if receivedOffer.Type != "webrtc_offer" {
 		t.Errorf("User2 expected 'webrtc_offer', got '%s'", receivedOffer.Type)
 	}
@@ -211,10 +217,7 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 	ws2.WriteJSON(answerMsg)
 
 	// User1 should receive the answer
-	var receivedAnswer Message
-	if err := ws1.ReadJSON(&receivedAnswer); err != nil {
-		t.Fatalf("User1 failed to read answer: %v", err)
-	}
+	receivedAnswer := readNextMessage(t, ws1, 200*time.Millisecond)
 	if receivedAnswer.Type != "webrtc_answer" {
 		t.Errorf("User1 expected 'webrtc_answer', got '%s'", receivedAnswer.Type)
 	}
@@ -225,11 +228,142 @@ func TestWebRTC_PeerToPeerFlow(t *testing.T) {
 	ws1.WriteJSON(candidateMsg)
 
 	// User2 should receive the ICE candidate
-	var receivedCandidate Message
-	if err := ws2.ReadJSON(&receivedCandidate); err != nil {
-		t.Fatalf("User2 failed to read candidate: %v", err)
-	}
+	receivedCandidate := readNextMessage(t, ws2, 200*time.Millisecond)
 	if receivedCandidate.Type != "webrtc_candidate" {
 		t.Errorf("User2 expected 'webrtc_candidate', got '%s'", receivedCandidate.Type)
+	}
+}
+
+func TestPrivateMessage(t *testing.T) {
+	hub := newHub()
+	go hub.run()
+
+	// Client 1
+	server1, ws1 := newTestServerAndClient(t, hub, "private_chat", "user1")
+	defer server1.Close()
+	defer ws1.Close()
+
+	// Client 2
+	server2, ws2 := newTestServerAndClient(t, hub, "private_chat", "user2")
+	defer server2.Close()
+	defer ws2.Close()
+
+	// Client 3
+	server3, ws3 := newTestServerAndClient(t, hub, "private_chat", "user3")
+	defer server3.Close()
+	defer ws3.Close()
+
+	// Clear initial user list updates for all clients
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user1 connects
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user2 connects
+	readUserListUpdate(t, ws2, 200*time.Millisecond) // user2 connects
+	readUserListUpdate(t, ws1, 200*time.Millisecond) // user3 connects
+	readUserListUpdate(t, ws2, 200*time.Millisecond) // user3 connects
+	readUserListUpdate(t, ws3, 200*time.Millisecond) // user3 connects
+
+	// User 1 sends a private message to User 2
+	privateMsg := Message{
+		Type:   "private_message",
+		ToUser: "user2",
+		Payload: ChatPayload{
+			Content: "This is a private message.",
+		},
+	}
+	if err := ws1.WriteJSON(privateMsg); err != nil {
+		t.Fatalf("Failed to write private message: %v", err)
+	}
+
+	// User 2 should receive the message
+	receivedMsg := readNextMessage(t, ws2, 200*time.Millisecond)
+	if receivedMsg.Type != "private_message" {
+		t.Errorf("Expected message type 'private_message', got '%s'", receivedMsg.Type)
+	}
+	if receivedMsg.FromUser != "user1" {
+		t.Errorf("Expected message from 'user1', got '%s'", receivedMsg.FromUser)
+	}
+	payload, ok := receivedMsg.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Could not assert payload type")
+	}
+	if payload["content"] != "This is a private message." {
+		t.Errorf("Unexpected private message content: got '%s'", payload["content"])
+	}
+
+	// User 3 should not receive the private message.
+	// We'll read with a timeout and ensure no 'private_message' type comes through.
+	ws3.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	for {
+		discardedMsg := readNextMessage(t, ws3, 100*time.Millisecond)
+		if discardedMsg.Type == "" { // This indicates a read error, likely a timeout
+			break // Correctly timed out
+		}
+		if discardedMsg.Type == "private_message" {
+			t.Errorf("User 3 unexpectedly received a private message: %+v", discardedMsg)
+			break
+		}
+		// It's okay if they receive other messages, like user list updates.
+	}
+}
+
+func TestUserListBroadcast(t *testing.T) {
+	hub := newHub()
+	go hub.run()
+	timeout := 200 * time.Millisecond
+
+	// Client 1
+	server1, ws1 := newTestServerAndClient(t, hub, "user_list_test", "user1")
+	defer server1.Close()
+	defer ws1.Close()
+
+	// Client 1 should receive a user list with just itself
+	msg1 := readUserListUpdate(t, ws1, timeout)
+	if len(msg1.Payload.(UserListPayload).Users) != 1 {
+		t.Errorf("Expected 1 user, got %d", len(msg1.Payload.(UserListPayload).Users))
+	}
+
+	// Client 2
+	server2, ws2 := newTestServerAndClient(t, hub, "user_list_test", "user2")
+	defer server2.Close()
+	defer ws2.Close()
+
+	// Both clients should receive an updated user list
+	msg1_update := readUserListUpdate(t, ws1, timeout)
+	if len(msg1_update.Payload.(UserListPayload).Users) != 2 {
+		t.Errorf("Expected 2 users, got %d", len(msg1_update.Payload.(UserListPayload).Users))
+	}
+	msg2_update := readUserListUpdate(t, ws2, timeout)
+	if len(msg2_update.Payload.(UserListPayload).Users) != 2 {
+		t.Errorf("Expected 2 users, got %d", len(msg2_update.Payload.(UserListPayload).Users))
+	}
+
+	// Disconnect User 2
+	ws2.Close()
+
+	// User 1 should receive another update
+	msg1_final := readUserListUpdate(t, ws1, timeout)
+	if len(msg1_final.Payload.(UserListPayload).Users) != 1 {
+		t.Errorf("Expected 1 user, got %d", len(msg1_final.Payload.(UserListPayload).Users))
+	}
+}
+
+// Helper function to specifically read a user list update message
+func readUserListUpdate(t *testing.T, ws *websocket.Conn, timeout time.Duration) Message {
+	ws.SetReadDeadline(time.Now().Add(timeout))
+	defer ws.SetReadDeadline(time.Time{}) // Reset deadline
+	var msg Message
+	for {
+		if err := ws.ReadJSON(&msg); err != nil {
+			t.Fatalf("Failed to read message: %v", err)
+		}
+		if msg.Type == "update_user_list" {
+			// Unmarshal payload to ensure it's the correct type
+			var payload UserListPayload
+			payloadBytes, _ := json.Marshal(msg.Payload)
+			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+				t.Fatalf("Failed to unmarshal UserListPayload: %v", err)
+			}
+			msg.Payload = payload // Replace the generic map with the struct
+			return msg
+		}
 	}
 }
