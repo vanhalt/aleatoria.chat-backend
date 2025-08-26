@@ -84,7 +84,41 @@ The `type` field in the message determines its purpose and the expected structur
     }
     ```
 
-### User Availability
+### Private Messaging
+
+#### `private_message`
+
+-   **Direction**: Client -> Server -> Client
+-   **Description**: Sends a private text message to a specific user.
+-   **Message Fields**:
+    -   `toUser`: The `userId` of the recipient.
+-   **Payload (`ChatPayload`)**:
+    ```json
+    {
+      "content": "This is a private message."
+    }
+    ```
+
+### User Presence
+
+#### `get_user_list`
+
+-   **Direction**: Client -> Server
+-   **Description**: Requests the list of all currently connected users. The server will respond with an `update_user_list` message.
+-   **Payload**: None.
+
+#### `update_user_list`
+
+-   **Direction**: Server -> Client
+-   **Description**: Sent by the server to all clients whenever the list of connected users changes (a user connects or disconnects). It is also sent in response to a `get_user_list` request.
+-   **Payload (`UserListPayload`)**:
+    ```json
+    {
+      "users": ["user1", "user2", "user3"]
+    }
+    ```
+
+### WebRTC Availability
 
 #### `user_available_webrtc`
 
@@ -327,5 +361,10 @@ type WebRTCIceCandidatePayload struct {
 type AssignRolePayload struct {
     Role   string `json:"role"`
     PeerId string `json:"peerId"`
+}
+
+// For "update_user_list"
+type UserListPayload struct {
+	Users []string `json:"users"`
 }
 ```
