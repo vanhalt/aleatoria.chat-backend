@@ -382,7 +382,8 @@ func (c *Client) readPump(hub *Hub) {
 
 		// Populate server-authoritative fields
 		msg.FromUser = c.id
-		if msg.Type == "chat_message" { // For chat messages, ensure they are associated with the client's current room
+		if msg.Type == "chat_message" && msg.ToUser == "" { 
+			// For chat messages that are NOT DMs, ensure they are associated with the client's current room
 			msg.Room = c.room
 		}
 		// If CreateTime is not set by client, or to enforce server time:
