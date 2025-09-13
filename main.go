@@ -214,7 +214,19 @@ func (h *Hub) run() {
 
 			switch message.Type {
 			case "chat_message":
-				if roomClients, ok := h.rooms[message.Room]; ok {
+				// Check if it's a direct message first
+				if message.ToUser != "" {
+					// Direct message - send only to the specific user
+					log.Printf("Routing direct message from %s to %s", message.FromUser, message.ToUser)
+					h.sendToClientUnsafe(message.ToUser, message)
+					
+					// Also send a copy back to the sender for their UI
+					// Mark it as outgoing for the sender
+					senderCopy := message
+					senderCopy.Incoming = false
+					h.sendToClientUnsafe(message.FromUser, senderCopy)
+				} else if roomClients, ok := h.rooms[message.Room]; ok {
+					// Room broadcast - existing logic
 					jsonMessage, err := json.Marshal(message)
 					if err != nil {
 						log.Printf("Error marshalling chat_message: %v. Message: %+v", err, message)
@@ -232,6 +244,8 @@ func (h *Hub) run() {
 							// Potentially unregister this client - complex due to lock
 						}
 					}
+				} else {
+					log.Printf("Chat message from %s has neither ToUser nor valid Room. Discarding.", message.FromUser)
 				}
 			case "webrtc_offer", "webrtc_answer", "webrtc_candidate":
 				if message.ToUser != "" {
