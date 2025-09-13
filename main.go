@@ -24,10 +24,11 @@ var upgrader = websocket.Upgrader{
 
 // Client represents a single chatting user.
 type Client struct {
-	conn *websocket.Conn
-	send chan []byte // Outbound messages are JSON byte slices
-	room string
-	id   string      // Unique client identifier (e.g. from query param, not heavily used yet)
+	conn  *websocket.Conn
+	send  chan []byte      // Outbound messages are JSON byte slices
+	rooms map[string]bool  // Set of rooms the client is in
+	id    string           // Unique client identifier (e.g. from query param, not heavily used yet)
+	hub   *Hub             // Reference to hub for room management
 }
 
 // Hub maintains the set of active clients and broadcasts messages to the
@@ -44,7 +45,7 @@ type Hub struct {
 
 // Message defines the generic structure for all WebSocket messages.
 type Message struct {
-	Type       string      `json:"type"`                 // e.g., "chat_message", "webrtc_offer", "webrtc_answer", "webrtc_candidate", "assign_role"
+	Type       string      `json:"type"`                 // e.g., "chat_message", "webrtc_offer", "webrtc_answer", "webrtc_candidate", "assign_role", "join_room", "leave_room"
 	FromUser   string      `json:"fromUser,omitempty"`   // Sender's client ID
 	ToUser     string      `json:"toUser,omitempty"`     // Recipient's client ID (for direct messages)
 	Room       string      `json:"room,omitempty"`       // Chat room ID or a call-specific context
@@ -88,6 +89,12 @@ type RequestRandomPeerPayload struct {
 	CurrentPeerID string `json:"currentPeerId,omitempty"` // If user is skipping someone
 }
 
+// Payload for room management
+type RoomActionPayload struct {
+	Room   string `json:"room"`   // Room to join or leave
+	Action string `json:"action"` // "join" or "leave"
+}
+
 
 func newHub() *Hub {
 	return &Hub{
@@ -129,6 +136,15 @@ func addUserToAvailable(userID string) {
 	log.Printf("User %s added to available list. Total available: %d", userID, len(availableForCall))
 }
 
+// Helper function to get list of rooms from map
+func getRoomList(rooms map[string]bool) []string {
+	roomList := make([]string, 0, len(rooms))
+	for room := range rooms {
+		roomList = append(roomList, room)
+	}
+	return roomList
+}
+
 
 // sendToClient sends a message to a specific client by their ID.
 // IMPORTANT: This function must be called with h.mu locked if it modifies shared client state,
@@ -166,19 +182,17 @@ func (h *Hub) run() {
 			h.clients[client] = true
 			if client.id != "" {
 				h.clientsByID[client.id] = client
-				// By default, new users are not added to availableForCall list for WebRTC.
-				// They need to explicitly indicate availability.
-				// Or, if chat room implies WebRTC context, can add them here.
-				// For now, let's assume chat clients join a chat room:
-				if client.room != "" { // If room is specified (e.g. for chat)
-					if _, ok := h.rooms[client.room]; !ok {
-						h.rooms[client.room] = make(map[*Client]bool)
+				// Join initial rooms if any
+				for room := range client.rooms {
+					if _, ok := h.rooms[room]; !ok {
+						h.rooms[room] = make(map[*Client]bool)
 					}
-					h.rooms[client.room][client] = true
+					h.rooms[room][client] = true
+					log.Printf("Client %s joined room %s", client.id, room)
 				}
 			}
-			log.Printf("Client %s (ID: %s) registered. Room: %s. Total clients: %d. Total clientsByID: %d",
-				client.conn.RemoteAddr(), client.id, client.room, len(h.clients), len(h.clientsByID))
+			log.Printf("Client %s (ID: %s) registered. Rooms: %v. Total clients: %d. Total clientsByID: %d",
+				client.conn.RemoteAddr(), client.id, getRoomList(client.rooms), len(h.clients), len(h.clientsByID))
 			h.mu.Unlock()
 
 		case client := <-h.unregister:
@@ -191,14 +205,17 @@ func (h *Hub) run() {
 					log.Printf("User %s removed from available list during unregister.", client.id)
 				}
 				close(client.send)
-				if client.room != "" && h.rooms[client.room] != nil { // If was in a chat room
-					delete(h.rooms[client.room], client)
-					if len(h.rooms[client.room]) == 0 {
-						delete(h.rooms, client.room)
-						log.Printf("Chat room %s closed", client.room)
+				// Remove from all rooms
+				for room := range client.rooms {
+					if roomClients, ok := h.rooms[room]; ok {
+						delete(roomClients, client)
+						if len(roomClients) == 0 {
+							delete(h.rooms, room)
+							log.Printf("Chat room %s closed", room)
+						}
 					}
 				}
-				log.Printf("Client %s (ID: %s) unregistered. Room: %s", client.conn.RemoteAddr(), client.id, client.room)
+				log.Printf("Client %s (ID: %s) unregistered. Was in rooms: %v", client.conn.RemoteAddr(), client.id, getRoomList(client.rooms))
 			}
 			h.mu.Unlock()
 
@@ -225,27 +242,39 @@ func (h *Hub) run() {
 					senderCopy := message
 					senderCopy.Incoming = false
 					h.sendToClientUnsafe(message.FromUser, senderCopy)
-				} else if roomClients, ok := h.rooms[message.Room]; ok {
-					// Room broadcast - existing logic
-					jsonMessage, err := json.Marshal(message)
-					if err != nil {
-						log.Printf("Error marshalling chat_message: %v. Message: %+v", err, message)
-						break // Break switch, will release lock in defer
-					}
-					for cl := range roomClients {
-						if cl.id == message.FromUser && message.Room == cl.room { // Don't send to self if it's a self-echo from same room
-							// This depends on whether client expects echo or not. Usually not for chat.
-							// continue
+				} else if message.Room != "" {
+					// Room broadcast - verify sender is in the room
+					senderClient, senderExists := h.clientsByID[message.FromUser]
+					if senderExists && senderClient.rooms != nil && senderClient.rooms[message.Room] {
+						// Sender is in the room, broadcast to all room members
+						if roomClients, ok := h.rooms[message.Room]; ok {
+							jsonMessage, err := json.Marshal(message)
+							if err != nil {
+								log.Printf("Error marshalling chat_message: %v. Message: %+v", err, message)
+								break
+							}
+							for cl := range roomClients {
+								select {
+								case cl.send <- jsonMessage:
+								default:
+									log.Printf("Chat: Client %s (ID: %s) disconnected due to full send channel.", cl.conn.RemoteAddr(), cl.id)
+								}
+							}
 						}
-						select {
-						case cl.send <- jsonMessage:
-						default:
-							log.Printf("Chat: Client %s (ID: %s) in room %s disconnected due to full send channel.", cl.conn.RemoteAddr(), cl.id, cl.room)
-							// Potentially unregister this client - complex due to lock
+					} else {
+						log.Printf("Client %s tried to send to room %s but is not a member", message.FromUser, message.Room)
+						// Send error back to sender
+						errorMsg := Message{
+							Type:       "error",
+							FromUser:   "system",
+							ToUser:     message.FromUser,
+							Payload:    map[string]string{"error": "You are not in that room. Join the room first."},
+							CreateTime: time.Now().Format(time.RFC3339Nano),
 						}
+						h.sendToClientUnsafe(message.FromUser, errorMsg)
 					}
 				} else {
-					log.Printf("Chat message from %s has neither ToUser nor valid Room. Discarding.", message.FromUser)
+					log.Printf("Chat message from %s has neither ToUser nor Room. Discarding.", message.FromUser)
 				}
 			case "webrtc_offer", "webrtc_answer", "webrtc_candidate":
 				if message.ToUser != "" {
@@ -268,6 +297,86 @@ func (h *Hub) run() {
 			case "user_unavailable_webrtc":
 				log.Printf("User %s marked as unavailable for WebRTC.", message.FromUser)
 				removeUserFromAvailable(message.FromUser)
+
+			case "join_room":
+				// Handle room join request
+				if message.Room != "" && message.FromUser != "" {
+					if client, ok := h.clientsByID[message.FromUser]; ok {
+						// Add client to the room
+						if client.rooms == nil {
+							client.rooms = make(map[string]bool)
+						}
+						client.rooms[message.Room] = true
+						
+						// Add to hub's room map
+						if _, ok := h.rooms[message.Room]; !ok {
+							h.rooms[message.Room] = make(map[*Client]bool)
+						}
+						h.rooms[message.Room][client] = true
+						
+						log.Printf("Client %s joined room %s", message.FromUser, message.Room)
+						
+						// Send confirmation back to client
+						confirmMsg := Message{
+							Type:       "room_joined",
+							Room:       message.Room,
+							FromUser:   "system",
+							ToUser:     message.FromUser,
+							Payload:    RoomActionPayload{Room: message.Room, Action: "joined"},
+							CreateTime: time.Now().Format(time.RFC3339Nano),
+						}
+						h.sendToClientUnsafe(message.FromUser, confirmMsg)
+					}
+				}
+				
+			case "leave_room":
+				// Handle room leave request
+				if message.Room != "" && message.FromUser != "" {
+					if client, ok := h.clientsByID[message.FromUser]; ok {
+						// Remove client from the room
+						if client.rooms != nil {
+							delete(client.rooms, message.Room)
+						}
+						
+						// Remove from hub's room map
+						if roomClients, ok := h.rooms[message.Room]; ok {
+							delete(roomClients, client)
+							if len(roomClients) == 0 {
+								delete(h.rooms, message.Room)
+								log.Printf("Room %s closed (no clients)", message.Room)
+							}
+						}
+						
+						log.Printf("Client %s left room %s", message.FromUser, message.Room)
+						
+						// Send confirmation back to client
+						confirmMsg := Message{
+							Type:       "room_left",
+							Room:       message.Room,
+							FromUser:   "system",
+							ToUser:     message.FromUser,
+							Payload:    RoomActionPayload{Room: message.Room, Action: "left"},
+							CreateTime: time.Now().Format(time.RFC3339Nano),
+						}
+						h.sendToClientUnsafe(message.FromUser, confirmMsg)
+					}
+				}
+				
+			case "get_rooms":
+				// Return list of rooms the client is in
+				if message.FromUser != "" {
+					if client, ok := h.clientsByID[message.FromUser]; ok {
+						roomList := getRoomList(client.rooms)
+						roomsMsg := Message{
+							Type:       "rooms_list",
+							FromUser:   "system",
+							ToUser:     message.FromUser,
+							Payload:    map[string]interface{}{"rooms": roomList},
+							CreateTime: time.Now().Format(time.RFC3339Nano),
+						}
+						h.sendToClientUnsafe(message.FromUser, roomsMsg)
+					}
+				}
 
 			case "request_random_peer":
 				log.Printf("User %s requests a random peer.", message.FromUser)
@@ -382,10 +491,7 @@ func (c *Client) readPump(hub *Hub) {
 
 		// Populate server-authoritative fields
 		msg.FromUser = c.id
-		if msg.Type == "chat_message" && msg.ToUser == "" { 
-			// For chat messages that are NOT DMs, ensure they are associated with the client's current room
-			msg.Room = c.room
-		}
+		// Clients now specify the room they want to send to
 		// If CreateTime is not set by client, or to enforce server time:
 		if msg.CreateTime == "" {
 			msg.CreateTime = time.Now().Format(time.RFC3339Nano)
@@ -424,9 +530,6 @@ func (c *Client) writePump() {
 
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	roomName := r.URL.Query().Get("room")
-	if roomName == "" {
-		roomName = "Lobby" // Default room
-	}
 	userId := r.URL.Query().Get("userId") // Get userId from query param
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -435,18 +538,29 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Initialize client with support for multiple rooms
 	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 256),
-		room: roomName,
-		id:   userId, // Store the userId
+		conn:  conn,
+		send:  make(chan []byte, 256),
+		rooms: make(map[string]bool),
+		id:    userId,
+		hub:   hub,
 	}
+	
+	// If a room was specified in the URL, join it initially
+	if roomName != "" {
+		client.rooms[roomName] = true
+	} else {
+		// Default to Lobby if no room specified
+		client.rooms["Lobby"] = true
+	}
+	
 	hub.register <- client
 
 	go client.writePump()
 	go client.readPump(hub)
 
-	log.Printf("Client %s (ID: %s) connected to room: %s", conn.RemoteAddr(), userId, roomName)
+	log.Printf("Client %s (ID: %s) connected with initial rooms: %v", conn.RemoteAddr(), userId, getRoomList(client.rooms))
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
