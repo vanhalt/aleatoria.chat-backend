@@ -20,15 +20,17 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin:     ValidateOrigin,
+	// Add timeouts to prevent zombie connections
+	HandshakeTimeout: 10 * time.Second,
 }
 
 // Client represents a single chatting user.
 type Client struct {
 	conn  *websocket.Conn
-	send  chan []byte      // Outbound messages are JSON byte slices
-	rooms map[string]bool  // Set of rooms the client is in
-	id    string           // Unique client identifier (e.g. from query param, not heavily used yet)
-	hub   *Hub             // Reference to hub for room management
+	send  chan []byte     // Outbound messages are JSON byte slices
+	rooms map[string]bool // Set of rooms the client is in
+	id    string          // Unique client identifier (e.g. from query param, not heavily used yet)
+	hub   *Hub            // Reference to hub for room management
 }
 
 // Hub maintains the set of active clients and broadcasts messages to the
@@ -52,7 +54,7 @@ type Message struct {
 	Payload    interface{} `json:"payload,omitempty"`    // Flexible payload based on Type
 	MessageID  string      `json:"messageId,omitempty"`  // Unique message ID, typically client-generated
 	CreateTime string      `json:"createTime,omitempty"` // Timestamp, can be client or server generated/overridden
-	Incoming   bool        `json:"incoming,omitempty"` // incoming message from remote user or not
+	Incoming   bool        `json:"incoming,omitempty"`   // incoming message from remote user or not
 }
 
 // Specific payload structures
@@ -95,15 +97,14 @@ type RoomActionPayload struct {
 	Action string `json:"action"` // "join" or "leave"
 }
 
-
 func newHub() *Hub {
 	return &Hub{
-		broadcast:          make(chan Message),
-		register:           make(chan *Client),
-		unregister:         make(chan *Client),
-		clients:            make(map[*Client]bool),
-		clientsByID:        make(map[string]*Client),
-		rooms:              make(map[string]map[*Client]bool),
+		broadcast:   make(chan Message),
+		register:    make(chan *Client),
+		unregister:  make(chan *Client),
+		clients:     make(map[*Client]bool),
+		clientsByID: make(map[string]*Client),
+		rooms:       make(map[string]map[*Client]bool),
 		// availableForCall: make(map[string]bool), // Client IDs available for calls
 	}
 }
@@ -145,7 +146,6 @@ func getRoomList(rooms map[string]bool) []string {
 	return roomList
 }
 
-
 // sendToClient sends a message to a specific client by their ID.
 // IMPORTANT: This function must be called with h.mu locked if it modifies shared client state,
 // or if called from a context that already holds the lock.
@@ -171,7 +171,6 @@ func (h *Hub) sendToClientUnsafe(clientID string, message Message) {
 		log.Printf("Client %s not found for direct message.", clientID)
 	}
 }
-
 
 func (h *Hub) run() {
 	for {
@@ -236,7 +235,7 @@ func (h *Hub) run() {
 					// Direct message - send only to the specific user
 					log.Printf("Routing direct message from %s to %s", message.FromUser, message.ToUser)
 					h.sendToClientUnsafe(message.ToUser, message)
-					
+
 					// Also send a copy back to the sender for their UI
 					// Mark it as outgoing for the sender
 					senderCopy := message
@@ -307,15 +306,15 @@ func (h *Hub) run() {
 							client.rooms = make(map[string]bool)
 						}
 						client.rooms[message.Room] = true
-						
+
 						// Add to hub's room map
 						if _, ok := h.rooms[message.Room]; !ok {
 							h.rooms[message.Room] = make(map[*Client]bool)
 						}
 						h.rooms[message.Room][client] = true
-						
+
 						log.Printf("Client %s joined room %s", message.FromUser, message.Room)
-						
+
 						// Send confirmation back to client
 						confirmMsg := Message{
 							Type:       "room_joined",
@@ -328,7 +327,7 @@ func (h *Hub) run() {
 						h.sendToClientUnsafe(message.FromUser, confirmMsg)
 					}
 				}
-				
+
 			case "leave_room":
 				// Handle room leave request
 				if message.Room != "" && message.FromUser != "" {
@@ -337,7 +336,7 @@ func (h *Hub) run() {
 						if client.rooms != nil {
 							delete(client.rooms, message.Room)
 						}
-						
+
 						// Remove from hub's room map
 						if roomClients, ok := h.rooms[message.Room]; ok {
 							delete(roomClients, client)
@@ -346,9 +345,9 @@ func (h *Hub) run() {
 								log.Printf("Room %s closed (no clients)", message.Room)
 							}
 						}
-						
+
 						log.Printf("Client %s left room %s", message.FromUser, message.Room)
-						
+
 						// Send confirmation back to client
 						confirmMsg := Message{
 							Type:       "room_left",
@@ -361,7 +360,7 @@ func (h *Hub) run() {
 						h.sendToClientUnsafe(message.FromUser, confirmMsg)
 					}
 				}
-				
+
 			case "get_rooms":
 				// Return list of rooms the client is in
 				if message.FromUser != "" {
@@ -430,11 +429,11 @@ func (h *Hub) run() {
 					h.sendToClientUnsafe(selectedPeerID, msgToSelected)
 
 					// Crucially, after successful pairing for negotiation, remove them from general availability
-                    // This prevents them from being immediately picked by another request.
-                    // They should re-declare availability after their call ends.
-                    removeUserFromAvailable(message.FromUser)
-                    removeUserFromAvailable(selectedPeerID)
-                    log.Printf("Users %s and %s paired for WebRTC negotiation, removed from available list.", message.FromUser, selectedPeerID)
+					// This prevents them from being immediately picked by another request.
+					// They should re-declare availability after their call ends.
+					removeUserFromAvailable(message.FromUser)
+					removeUserFromAvailable(selectedPeerID)
+					log.Printf("Users %s and %s paired for WebRTC negotiation, removed from available list.", message.FromUser, selectedPeerID)
 
 				} else {
 					// No peer available
@@ -442,6 +441,16 @@ func (h *Hub) run() {
 					msgToRequester := Message{Type: "no_peer_available", ToUser: message.FromUser, FromUser: "system", Payload: noPeerPayload, CreateTime: time.Now().Format(time.RFC3339Nano)}
 					h.sendToClientUnsafe(message.FromUser, msgToRequester)
 					log.Printf("No suitable peer found for %s.", message.FromUser)
+				}
+
+			case "hangup":
+				// Handle hangup message - forward to the peer
+				if message.ToUser != "" {
+					log.Printf("Routing hangup message from %s to %s", message.FromUser, message.ToUser)
+					h.sendToClientUnsafe(message.ToUser, message)
+
+					// Both users should re-declare availability after hangup
+					// Note: They should do this themselves, but we can add a delay to prevent immediate re-pairing
 				}
 
 			default:
@@ -457,10 +466,18 @@ func (c *Client) readPump(hub *Hub) {
 		hub.unregister <- c
 		c.conn.Close()
 	}()
+
+	// Set read deadline to detect disconnected clients
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	for {
 		_, messageBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
 				log.Printf("error reading message: %v, client: %s (ID: %s)", err, c.conn.RemoteAddr(), c.id)
 			}
 			break
@@ -508,12 +525,16 @@ func (c *Client) readPump(hub *Hub) {
 }
 
 func (c *Client) writePump() {
+	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
+		ticker.Stop()
 		c.conn.Close()
 	}()
+
 	for {
 		select {
 		case messageBytes, ok := <-c.send: // Expecting JSON bytes
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				log.Printf("Hub closed channel for client %s (ID: %s)", c.conn.RemoteAddr(), c.id)
@@ -522,6 +543,11 @@ func (c *Client) writePump() {
 			if err := c.conn.WriteMessage(websocket.TextMessage, messageBytes); err != nil {
 				log.Printf("error writing message: %v, client: %s (ID: %s)", err, c.conn.RemoteAddr(), c.id)
 				// Consider unregistering the client on write error
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
@@ -546,7 +572,7 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		id:    userId,
 		hub:   hub,
 	}
-	
+
 	// If a room was specified in the URL, join it initially
 	if roomName != "" {
 		client.rooms[roomName] = true
@@ -554,7 +580,7 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		// Default to Lobby if no room specified
 		client.rooms["Lobby"] = true
 	}
-	
+
 	hub.register <- client
 
 	go client.writePump()
