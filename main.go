@@ -43,6 +43,7 @@ type Hub struct {
 	unregister  chan *Client
 	rooms       map[string]map[*Client]bool
 	mu          sync.Mutex
+	redisStore  *RedisStore // Redis persistence layer
 }
 
 // Message defines the generic structure for all WebSocket messages.
@@ -105,37 +106,10 @@ func newHub() *Hub {
 		clients:     make(map[*Client]bool),
 		clientsByID: make(map[string]*Client),
 		rooms:       make(map[string]map[*Client]bool),
-		// availableForCall: make(map[string]bool), // Client IDs available for calls
+		redisStore:  NewRedisStore(),
 	}
 }
 
-// Helper to manage available users. For simplicity, a slice. Could be a map for faster removal.
-var availableForCall []string
-var availableForCallMu sync.Mutex
-
-func removeUserFromAvailable(userID string) {
-	availableForCallMu.Lock()
-	defer availableForCallMu.Unlock()
-	for i, id := range availableForCall {
-		if id == userID {
-			availableForCall = append(availableForCall[:i], availableForCall[i+1:]...)
-			return
-		}
-	}
-}
-
-func addUserToAvailable(userID string) {
-	availableForCallMu.Lock()
-	defer availableForCallMu.Unlock()
-	// Avoid duplicates
-	for _, id := range availableForCall {
-		if id == userID {
-			return
-		}
-	}
-	availableForCall = append(availableForCall, userID)
-	log.Printf("User %s added to available list. Total available: %d", userID, len(availableForCall))
-}
 
 // Helper function to get list of rooms from map
 func getRoomList(rooms map[string]bool) []string {
@@ -187,6 +161,10 @@ func (h *Hub) run() {
 						h.rooms[room] = make(map[*Client]bool)
 					}
 					h.rooms[room][client] = true
+					// Persist to Redis
+					if err := h.redisStore.AddUserToRoom(room, client.id); err != nil {
+						log.Printf("Warning: Failed to persist room join to Redis: %v", err)
+					}
 					log.Printf("Client %s joined room %s", client.id, room)
 				}
 			}
@@ -200,7 +178,10 @@ func (h *Hub) run() {
 				delete(h.clients, client)
 				if client.id != "" {
 					delete(h.clientsByID, client.id)
-					removeUserFromAvailable(client.id) // Remove from WebRTC available list
+					// Remove from WebRTC available list in Redis
+					if err := h.redisStore.RemoveUserFromAvailable(client.id); err != nil {
+						log.Printf("Warning: Failed to remove user from available list in Redis: %v", err)
+					}
 					log.Printf("User %s removed from available list during unregister.", client.id)
 				}
 				close(client.send)
@@ -211,6 +192,12 @@ func (h *Hub) run() {
 						if len(roomClients) == 0 {
 							delete(h.rooms, room)
 							log.Printf("Chat room %s closed", room)
+						}
+					}
+					// Remove from Redis
+					if client.id != "" {
+						if err := h.redisStore.RemoveUserFromRoom(room, client.id); err != nil {
+							log.Printf("Warning: Failed to remove user from room in Redis: %v", err)
 						}
 					}
 				}
@@ -241,6 +228,11 @@ func (h *Hub) run() {
 					senderCopy := message
 					senderCopy.Incoming = false
 					h.sendToClientUnsafe(message.FromUser, senderCopy)
+
+					// Persist direct message to Redis
+					if err := h.redisStore.SaveDirectMessage(message.FromUser, message.ToUser, message); err != nil {
+						log.Printf("Warning: Failed to persist direct message to Redis: %v", err)
+					}
 				} else if message.Room != "" {
 					// Room broadcast - verify sender is in the room
 					senderClient, senderExists := h.clientsByID[message.FromUser]
@@ -258,6 +250,10 @@ func (h *Hub) run() {
 								default:
 									log.Printf("Chat: Client %s (ID: %s) disconnected due to full send channel.", cl.conn.RemoteAddr(), cl.id)
 								}
+							}
+							// Persist room message to Redis
+							if err := h.redisStore.SaveRoomMessage(message.Room, message); err != nil {
+								log.Printf("Warning: Failed to persist room message to Redis: %v", err)
 							}
 						}
 					} else {
@@ -289,13 +285,22 @@ func (h *Hub) run() {
 				}
 			case "user_available_webrtc":
 				log.Printf("User %s marked as available for WebRTC.", message.FromUser)
-				addUserToAvailable(message.FromUser)
+				if err := h.redisStore.AddUserToAvailable(message.FromUser); err != nil {
+					log.Printf("Warning: Failed to add user to available list in Redis: %v", err)
+				} else {
+					// Log available count
+					if count, err := h.redisStore.GetAvailableCount(); err == nil {
+						log.Printf("User %s added to available list. Total available: %d", message.FromUser, count)
+					}
+				}
 				// Optionally, confirm to user:
 				// h.sendToClientUnsafe(message.FromUser, Message{Type:"status_update", Payload: UserStatusPayload{UserID: message.FromUser, Status: "available_for_call", Timestamp: time.Now().Format(time.RFC3339Nano)}})
 
 			case "user_unavailable_webrtc":
 				log.Printf("User %s marked as unavailable for WebRTC.", message.FromUser)
-				removeUserFromAvailable(message.FromUser)
+				if err := h.redisStore.RemoveUserFromAvailable(message.FromUser); err != nil {
+					log.Printf("Warning: Failed to remove user from available list in Redis: %v", err)
+				}
 
 			case "join_room":
 				// Handle room join request
@@ -312,6 +317,11 @@ func (h *Hub) run() {
 							h.rooms[message.Room] = make(map[*Client]bool)
 						}
 						h.rooms[message.Room][client] = true
+
+						// Persist to Redis
+						if err := h.redisStore.AddUserToRoom(message.Room, message.FromUser); err != nil {
+							log.Printf("Warning: Failed to persist room join to Redis: %v", err)
+						}
 
 						log.Printf("Client %s joined room %s", message.FromUser, message.Room)
 
@@ -344,6 +354,11 @@ func (h *Hub) run() {
 								delete(h.rooms, message.Room)
 								log.Printf("Room %s closed (no clients)", message.Room)
 							}
+						}
+
+						// Remove from Redis
+						if err := h.redisStore.RemoveUserFromRoom(message.Room, message.FromUser); err != nil {
+							log.Printf("Warning: Failed to remove user from room in Redis: %v", err)
 						}
 
 						log.Printf("Client %s left room %s", message.FromUser, message.Room)
@@ -386,36 +401,19 @@ func (h *Hub) run() {
 					}
 				}
 
-				availableForCallMu.Lock()
-				var selectedPeerID string
-				if len(availableForCall) > 0 {
-					// Simple random selection for now, avoid self and currentPeerID
-					possiblePeers := []string{}
-					for _, potentialPeer := range availableForCall {
-						if potentialPeer != message.FromUser && potentialPeer != currentPeerID {
-							possiblePeers = append(possiblePeers, potentialPeer)
-						}
-					}
-
-					if len(possiblePeers) > 0 {
-						// Select a random peer from the possiblePeers list
-						randomIndex := rand.Intn(len(possiblePeers))
-						selectedPeerID = possiblePeers[randomIndex]
-
-						// Remove both from available list as they are about to be paired
-						// This needs to be careful with availableForCallMu if called from within loop
-						// It's better to collect IDs to remove and do it after loop or use map for availableForCall
-
-						// For now, simple removal (potential issues if many requests concurrently)
-						// This is a critical section that needs careful thought for concurrency.
-						// Let's just mark them conceptually for now and actual removal happens on call accept/start.
-						log.Printf("Found potential peer %s for %s", selectedPeerID, message.FromUser)
-
-					}
+				// Get random available peer from Redis, excluding self and current peer
+				excludeUsers := []string{message.FromUser}
+				if currentPeerID != "" {
+					excludeUsers = append(excludeUsers, currentPeerID)
 				}
-				availableForCallMu.Unlock() // Unlock before sending messages
 
-				log.Printf("Mutext was unlocked. selectedPeerID is: %s", selectedPeerID)
+				selectedPeerID, err := h.redisStore.GetRandomAvailablePeer(excludeUsers...)
+				if err != nil {
+					log.Printf("Error getting random peer: %v", err)
+					selectedPeerID = ""
+				}
+
+				log.Printf("Selected peer: %s for requester: %s", selectedPeerID, message.FromUser)
 
 				if selectedPeerID != "" {
 					// Assign roles: Requester is impolite, selected is polite
@@ -431,8 +429,12 @@ func (h *Hub) run() {
 					// Crucially, after successful pairing for negotiation, remove them from general availability
 					// This prevents them from being immediately picked by another request.
 					// They should re-declare availability after their call ends.
-					removeUserFromAvailable(message.FromUser)
-					removeUserFromAvailable(selectedPeerID)
+					if err := h.redisStore.RemoveUserFromAvailable(message.FromUser); err != nil {
+						log.Printf("Warning: Failed to remove requester from available list: %v", err)
+					}
+					if err := h.redisStore.RemoveUserFromAvailable(selectedPeerID); err != nil {
+						log.Printf("Warning: Failed to remove selected peer from available list: %v", err)
+					}
 					log.Printf("Users %s and %s paired for WebRTC negotiation, removed from available list.", message.FromUser, selectedPeerID)
 
 				} else {
@@ -451,6 +453,76 @@ func (h *Hub) run() {
 
 					// Both users should re-declare availability after hangup
 					// Note: They should do this themselves, but we can add a delay to prevent immediate re-pairing
+				}
+
+			case "get_recent_messages":
+				// Retrieve recent messages from a room
+				if message.FromUser != "" && message.Room != "" {
+					// Parse payload for limit and before timestamp
+					limit := int64(50) // Default limit
+					var beforeTime *time.Time
+
+					if payload, ok := message.Payload.(map[string]interface{}); ok {
+						if limitVal, ok := payload["limit"].(float64); ok {
+							limit = int64(limitVal)
+						}
+						if beforeStr, ok := payload["before"].(string); ok {
+							if t, err := time.Parse(time.RFC3339Nano, beforeStr); err == nil {
+								beforeTime = &t
+							}
+						}
+					}
+
+					messages, err := h.redisStore.GetRoomMessages(message.Room, limit, beforeTime)
+					if err != nil {
+						log.Printf("Error retrieving room messages: %v", err)
+						messages = []Message{} // Return empty array on error
+					}
+
+					responseMsg := Message{
+						Type:       "recent_messages",
+						FromUser:   "system",
+						ToUser:     message.FromUser,
+						Room:       message.Room,
+						Payload:    map[string]interface{}{"messages": messages, "room": message.Room},
+						CreateTime: time.Now().Format(time.RFC3339Nano),
+					}
+					h.sendToClientUnsafe(message.FromUser, responseMsg)
+					log.Printf("Sent %d recent messages from room %s to user %s", len(messages), message.Room, message.FromUser)
+				}
+
+			case "get_direct_messages":
+				// Retrieve direct messages between two users
+				if message.FromUser != "" {
+					withUser := ""
+					limit := int64(50) // Default limit
+
+					if payload, ok := message.Payload.(map[string]interface{}); ok {
+						if user, ok := payload["withUser"].(string); ok {
+							withUser = user
+						}
+						if limitVal, ok := payload["limit"].(float64); ok {
+							limit = int64(limitVal)
+						}
+					}
+
+					if withUser != "" {
+						messages, err := h.redisStore.GetDirectMessages(message.FromUser, withUser, limit)
+						if err != nil {
+							log.Printf("Error retrieving direct messages: %v", err)
+							messages = []Message{} // Return empty array on error
+						}
+
+						responseMsg := Message{
+							Type:       "direct_messages",
+							FromUser:   "system",
+							ToUser:     message.FromUser,
+							Payload:    map[string]interface{}{"messages": messages, "withUser": withUser},
+							CreateTime: time.Now().Format(time.RFC3339Nano),
+						}
+						h.sendToClientUnsafe(message.FromUser, responseMsg)
+						log.Printf("Sent %d direct messages between %s and %s", len(messages), message.FromUser, withUser)
+					}
 				}
 
 			default:
