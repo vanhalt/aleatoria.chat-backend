@@ -38,6 +38,11 @@ func NewRedisStore() *RedisStore {
 	valkeyAddr := fmt.Sprintf("%s:%s", valkeyHost, valkeyPort)
 	valkeyPassword := os.Getenv("VALKEY_PASSWORD")
 
+	valkeyUsername := os.Getenv("VALKEY_USERNAME")
+	if valkeyUsername == "" {
+		valkeyUsername = "default"
+	}
+
 	redisDB := 0
 	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
 		if db, err := strconv.Atoi(dbStr); err == nil {
@@ -54,6 +59,7 @@ func NewRedisStore() *RedisStore {
 
 	client := redis.NewClient(&redis.Options{
 		Addr:         valkeyAddr,
+		Username:     valkeyUsername,
 		Password:     valkeyPassword,
 		DB:           redisDB,
 		DialTimeout:  5 * time.Second,
