@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -43,6 +44,12 @@ func NewRedisStore() *RedisStore {
 		valkeyUsername = "default"
 	}
 
+	// TLS configuration - enabled by default for Digital Ocean compatibility
+	useTLS := true
+	if tlsEnv := os.Getenv("VALKEY_USE_TLS"); tlsEnv != "" {
+		useTLS = tlsEnv != "false" && tlsEnv != "0"
+	}
+
 	redisDB := 0
 	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
 		if db, err := strconv.Atoi(dbStr); err == nil {
@@ -57,7 +64,8 @@ func NewRedisStore() *RedisStore {
 		}
 	}
 
-	client := redis.NewClient(&redis.Options{
+	// Configure Redis client options
+	options := &redis.Options{
 		Addr:         valkeyAddr,
 		Username:     valkeyUsername,
 		Password:     valkeyPassword,
@@ -67,7 +75,16 @@ func NewRedisStore() *RedisStore {
 		WriteTimeout: 3 * time.Second,
 		PoolSize:     10,
 		MinIdleConns: 2,
-	})
+	}
+
+	// Enable TLS if configured
+	if useTLS {
+		options.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	client := redis.NewClient(options)
 
 	store := &RedisStore{
 		client:     client,
@@ -94,7 +111,11 @@ func NewRedisStore() *RedisStore {
 				sentry.CaptureException(err)
 			})
 		} else {
-			log.Printf("Valkey/Redis connected successfully at %s", valkeyAddr)
+			tlsStatus := "without TLS"
+			if useTLS {
+				tlsStatus = "with TLS"
+			}
+			log.Printf("Valkey/Redis connected successfully at %s (%s)", valkeyAddr, tlsStatus)
 
 			// Add breadcrumb for successful connection
 			sentry.AddBreadcrumb(&sentry.Breadcrumb{
@@ -104,6 +125,7 @@ func NewRedisStore() *RedisStore {
 				Timestamp: time.Now(),
 				Data: map[string]interface{}{
 					"address": valkeyAddr,
+					"tls":     useTLS,
 				},
 			})
 		}
