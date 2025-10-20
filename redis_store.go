@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -74,8 +75,31 @@ func NewRedisStore() *RedisStore {
 		defer cancel()
 		if err := client.Ping(ctx).Err(); err != nil {
 			log.Printf("WARNING: Valkey/Redis connection failed: %v. Will operate with degraded functionality.", err)
+
+			// Capture Redis connection failure
+			sentry.WithScope(func(scope *sentry.Scope) {
+				scope.SetTag("operation", "redis_connect")
+				scope.SetTag("redisAddr", valkeyAddr)
+				scope.SetLevel(sentry.LevelWarning)
+				scope.SetContext("redis_config", map[string]interface{}{
+					"address": valkeyAddr,
+					"db":      redisDB,
+				})
+				sentry.CaptureException(err)
+			})
 		} else {
 			log.Printf("Valkey/Redis connected successfully at %s", valkeyAddr)
+
+			// Add breadcrumb for successful connection
+			sentry.AddBreadcrumb(&sentry.Breadcrumb{
+				Category:  "redis",
+				Message:   "Redis connected successfully",
+				Level:     sentry.LevelInfo,
+				Timestamp: time.Now(),
+				Data: map[string]interface{}{
+					"address": valkeyAddr,
+				},
+			})
 		}
 	}()
 
@@ -106,6 +130,15 @@ func (rs *RedisStore) AddUserToRoom(roomID, userID string) error {
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		log.Printf("Redis error adding user %s to room %s: %v", userID, roomID, err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_add_user_to_room")
+			scope.SetTag("userId", userID)
+			scope.SetTag("room", roomID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 	return nil
@@ -125,6 +158,15 @@ func (rs *RedisStore) RemoveUserFromRoom(roomID, userID string) error {
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		log.Printf("Redis error removing user %s from room %s: %v", userID, roomID, err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_remove_user_from_room")
+			scope.SetTag("userId", userID)
+			scope.SetTag("room", roomID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 	return nil
@@ -167,6 +209,14 @@ func (rs *RedisStore) SaveRoomMessage(roomID string, message Message) error {
 	messageJSON, err := json.Marshal(message)
 	if err != nil {
 		log.Printf("Error marshalling message for Redis: %v", err)
+
+		// Capture marshalling error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_save_room_message_marshal")
+			scope.SetTag("room", roomID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
@@ -185,12 +235,28 @@ func (rs *RedisStore) SaveRoomMessage(roomID string, message Message) error {
 		Member: string(messageJSON),
 	}).Err(); err != nil {
 		log.Printf("Redis error saving room message to %s: %v", roomID, err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_save_room_message")
+			scope.SetTag("room", roomID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
 	// Set TTL on the key
 	if err := rs.client.Expire(ctx, key, rs.messageTTL).Err(); err != nil {
 		log.Printf("Redis error setting TTL for room %s: %v", roomID, err)
+
+		// Capture TTL error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_set_ttl_room")
+			scope.SetTag("room", roomID)
+			scope.SetLevel(sentry.LevelWarning)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
@@ -249,18 +315,45 @@ func (rs *RedisStore) SaveDirectMessage(fromUser, toUser string, message Message
 	messageJSON, err := json.Marshal(message)
 	if err != nil {
 		log.Printf("Error marshalling direct message for Redis: %v", err)
+
+		// Capture marshalling error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_save_dm_marshal")
+			scope.SetTag("fromUser", fromUser)
+			scope.SetTag("toUser", toUser)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
 	// Add to list (right push for chronological order)
 	if err := rs.client.RPush(ctx, key, string(messageJSON)).Err(); err != nil {
 		log.Printf("Redis error saving direct message: %v", err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_save_dm")
+			scope.SetTag("fromUser", fromUser)
+			scope.SetTag("toUser", toUser)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
 	// Set TTL on the key
 	if err := rs.client.Expire(ctx, key, rs.messageTTL).Err(); err != nil {
 		log.Printf("Redis error setting TTL for DM key %s: %v", key, err)
+
+		// Capture TTL error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_set_ttl_dm")
+			scope.SetTag("fromUser", fromUser)
+			scope.SetTag("toUser", toUser)
+			scope.SetLevel(sentry.LevelWarning)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 
@@ -334,8 +427,27 @@ func (rs *RedisStore) AddUserToAvailable(userID string) error {
 
 	if err := rs.client.SAdd(ctx, "available:webrtc", userID).Err(); err != nil {
 		log.Printf("Redis error adding user %s to available pool: %v", userID, err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_add_to_available")
+			scope.SetTag("userId", userID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
+
+	// Add breadcrumb for availability change
+	sentry.AddBreadcrumb(&sentry.Breadcrumb{
+		Category:  "redis",
+		Message:   "User added to available pool",
+		Level:     sentry.LevelInfo,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"userId": userID,
+		},
+	})
 	return nil
 }
 
@@ -346,6 +458,14 @@ func (rs *RedisStore) RemoveUserFromAvailable(userID string) error {
 
 	if err := rs.client.SRem(ctx, "available:webrtc", userID).Err(); err != nil {
 		log.Printf("Redis error removing user %s from available pool: %v", userID, err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_remove_from_available")
+			scope.SetTag("userId", userID)
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return err
 	}
 	return nil
@@ -360,6 +480,13 @@ func (rs *RedisStore) GetRandomAvailablePeer(excludeUsers ...string) (string, er
 	available, err := rs.client.SMembers(ctx, "available:webrtc").Result()
 	if err != nil {
 		log.Printf("Redis error getting available users: %v", err)
+
+		// Capture Redis operation error
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("operation", "redis_get_available_peers")
+			scope.SetLevel(sentry.LevelError)
+			sentry.CaptureException(err)
+		})
 		return "", err
 	}
 
@@ -377,11 +504,37 @@ func (rs *RedisStore) GetRandomAvailablePeer(excludeUsers ...string) (string, er
 	}
 
 	if len(possiblePeers) == 0 {
+		// Add breadcrumb for no peers available
+		sentry.AddBreadcrumb(&sentry.Breadcrumb{
+			Category:  "redis",
+			Message:   "No available peers found",
+			Level:     sentry.LevelInfo,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"totalAvailable": len(available),
+				"excludedCount":  len(excludeUsers),
+			},
+		})
 		return "", fmt.Errorf("no available peers")
 	}
 
 	// Return random peer (using the same rand that was seeded in init())
-	return possiblePeers[rand.Intn(len(possiblePeers))], nil
+	selectedPeer := possiblePeers[rand.Intn(len(possiblePeers))]
+
+	// Add breadcrumb for peer selection
+	sentry.AddBreadcrumb(&sentry.Breadcrumb{
+		Category:  "redis",
+		Message:   "Random peer selected",
+		Level:     sentry.LevelInfo,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"selectedPeer":   selectedPeer,
+			"possiblePeers":  len(possiblePeers),
+			"totalAvailable": len(available),
+		},
+	})
+
+	return selectedPeer, nil
 }
 
 // GetAvailableCount returns the count of users available for calls
